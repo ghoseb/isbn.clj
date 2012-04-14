@@ -5,6 +5,7 @@
             [clojure.core.cache :as cache]))
 
 (defonce price-cache (atom (cache/ttl-cache-factory 86400000 {})))
+(defonce info-cache (atom (cache/lru-cache-factory 100 {})))
 
 ;;; 9789380032825
 
@@ -52,10 +53,24 @@
     :selector [:span.variant-final-price html/text]}])
 
 
+(def ^{:doc "Sites which can provide us with book information."
+       :private true}
+  info-sites
+  {:flipkart {:url "http://www.flipkart.com/search.php?query=%s"
+              :selector #{[:div#mprodimg-id :img]                                    ; cover
+                          [[:h1 (html/attr= :itemprop "name")]]                      ; title
+                          [:div.primary-info.bmargin5 :h2 :a html/text]              ;author
+                          [:span.publishername html/text]                            ; publisher
+                          [:div.item_desc_text.description html/text]}}})            ; description
+
+
 (defn ^:private extract-price
   "Given the node which contains the price, extract the first thing that looks like a number from it."
   [price-node]
-  (when-let [price (ffirst (keep #(re-find #"[,\d]+(\.\d+)?$" %) (map #(clojure.string/replace % #"[\r\n\s]+" "") (filter string? price-node))))]
+  (when-let [price (->> price-node
+                        (filter string?)
+                        (map #(clojure.string/replace % #"[\r\n\s]+" ""))
+                        (keep #(re-find #"[,\d]+(\.\d+)?$" %)))]
     (Float/parseFloat (clojure.string/replace price #"," ""))))
 
 
@@ -90,3 +105,28 @@
     ;; put the missed sites in metadata
     (vary-meta (get @price-cache isbn {}) assoc ::miss (map :site missed-sites))))
 
+
+(defn get-book-info*
+  "Given an ISBN get the book info."
+  [isbn]
+  (try
+    (let [page (fetch-url (format (get-in info-sites [:flipkart :url]) isbn))
+          [img title author publisher description] (html/select page (get-in info-sites [:flipkart :selector]))]
+      (when (and title author)
+        (zipmap [:img :title :author :publisher :description :isbn]
+                [(get-in img [:attrs :src])
+                 (get-in title [:attrs :title])
+                 author
+                 publisher
+                 (apply str (html/emit* description))
+                 isbn])))
+    (catch Exception _)))
+
+
+(defn get-book-info
+  "Given an ISBN look up the cache for the info, if not cached, fetch, cache & return."
+  [isbn]
+  (if-let [cached-info (get @info-cache isbn)]
+    cached-info
+    (when-let [info (get-book-info* isbn)]
+      (get (swap! info-cache assoc isbn info) isbn))))
